@@ -22,7 +22,22 @@ import apache_beam as beam
 import tensorflow as tf
 from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.options.pipeline_options import SetupOptions
+from beam_nuggets.io import relational_db
 
+source_config = relational_db.SourceConfiguration(
+    drivername='mysql',
+    host='localhost',
+    port=8080,
+    username='usr',
+    password='sofe4630u',
+    database='smartmeter',
+)
+
+table_config = relational_db.TableConfiguration(
+    name='readings',
+    create_if_missing=True,
+    primary_key_columns=['profile_name']
+)
 
 def singleton(cls):
   instances = {}
@@ -45,8 +60,8 @@ class Model():
       inputs = json.loads(tf.compat.v1.get_collection('inputs')[0])
       outputs = json.loads(tf.compat.v1.get_collection('outputs')[0])
 
-      self.x = graph.get_tensor_by_name(inputs['image'])
-      self.p = graph.get_tensor_by_name(outputs['scores'])
+      self.x = graph.get_tensor_by_name(inputs['profile_name'])
+      self.p = graph.get_tensor_by_name(outputs['readings'])
       self.input_key = graph.get_tensor_by_name(inputs['key'])
       self.output_key = graph.get_tensor_by_name(outputs['key'])
       self.sess = sess
@@ -66,9 +81,9 @@ class PredictDoFn(beam.DoFn):
     attributes = {
       "time": time,
       "profile_name": profile_name,
-      "temperature": (temp * 1.8) + 32,
+      "temperature": temp,
       "humidity": humd,
-      "pressure": pres/6.895
+      "pressure": pres
     };
 
     if (attributes['temperature']==" " or attributes['humidity']==" " or attributes['pressure']==" "):
@@ -83,21 +98,26 @@ def run(argv=None):
                       help='Input file to process.')
   parser.add_argument('--output', dest='output', required=True,
                       help='Output file to write results to.')
-  parser.add_argument('--model', dest='model', required=True,
-                      help='Checkpoint file of the model.')
+  # parser.add_argument('--model', dest='model', required=True,
+                      # help='Checkpoint file of the model.')
   known_args, pipeline_args = parser.parse_known_args(argv)
   pipeline_options = PipelineOptions(pipeline_args)
   pipeline_options.view_as(SetupOptions).save_main_session = True;
   
   with beam.Pipeline(options=pipeline_options) as p:
-    images= (p | "Read from Pub/Sub" >> beam.io.ReadFromPubSub(topic=known_args.input)
+    profile_name = (p | "Read from Pub/Sub" >> beam.io.ReadFromPubSub(topic=known_args.input)
         | "toDict" >> beam.Map(lambda x: json.loads(x)));
         
-    predictions = images | 'Prediction' >> beam.ParDo(PredictDoFn(), known_args.model)
+    attributes = profile_name | 'Prediction' >> beam.ParDo(PredictDoFn(), known_args.model)
     
-    (predictions | 'to byte' >> beam.Map(lambda x: json.dumps(x).encode('utf8'))
+    (attributes | 'to byte' >> beam.Map(lambda x: json.dumps(x).encode('utf8'))
         |   'to Pub/sub' >> beam.io.WriteToPubSub(topic=known_args.output));
-        
+
+    profile_name = p | "Reading month records" >> beam.Create(profile_name)
+    attributes | 'Writing to DB table' >> relational_db.Write(
+      source_config=source_config,
+      table_config=table_config
+    )
 if __name__ == '__main__':
   logging.getLogger().setLevel(logging.INFO)
   run()
